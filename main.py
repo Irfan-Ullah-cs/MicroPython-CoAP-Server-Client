@@ -7,211 +7,237 @@ from hcsr04 import HCSR04
 from dht import DHT22
 import json
 import binascii
+import uasyncio as asyncio
 
-# Pins
-DHT_PIN = 21
-LIGHT_SENSOR_PIN = 34
-LED1_PIN = 13
-LED2_PIN = 12
-LED3_PIN = 27
-TRIG_PIN = 32
-ECHO_PIN = 33
-MAX_BIN_HEIGHT = 100
+# Pin Definitions
+class PinConfig:
+    DHT_PIN = 21
+    LIGHT_SENSOR_PIN = 34
+    LED1_PIN = 13  # Red
+    LED2_PIN = 12  # Yellow
+    LED3_PIN = 27  # Green
+    TRIG_PIN = 32
+    ECHO_PIN = 33
+    MAX_BIN_HEIGHT = 100  # cm
 
-# Initialize sensors and pins
-dht_sensor = DHT22(Pin(DHT_PIN))
-light_sensor = ADC(Pin(LIGHT_SENSOR_PIN))
-light_sensor.atten(ADC.ATTN_11DB)
+# Network Configuration
+class NetworkConfig:
+    WIFI_SSID = 'Galaxy A06 0a23'
+    WIFI_PASSWORD = '12345678'
+    SPRING_SERVER_IP = "192.168.152.113"
+    SPRING_SERVER_PORT = 5683
+    LED_STATUS_RESOURCE = "led-status"
 
-led1 = Pin(LED1_PIN, Pin.OUT)
-led2 = Pin(LED2_PIN, Pin.OUT)
-led3 = Pin(LED3_PIN, Pin.OUT)
-
-ultrasonic_sensor = HCSR04(trigger_pin=TRIG_PIN, echo_pin=ECHO_PIN)
-
-# Global variables
-led_states = {
-    "redLed": False,
-    "yellowLed": False,
-    "greenLed": False
-}
-
-# Spring Boot CoAP server details
-SPRING_SERVER_IP = "192.168.152.113"  # Replace with your Spring Boot server IP
-SPRING_SERVER_PORT = 5683
-LED_STATUS_RESOURCE = "led-status"
-
-def connect_wifi(ssid, password):
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
-    if not wlan.isconnected():
-        print('Connecting to network...')
-        wlan.connect(ssid, password)
-        while not wlan.isconnected():
-            pass
-    print('Network config:', wlan.ifconfig())
-    return wlan
-
-def get_distance():
-    try:
-        distance = ultrasonic_sensor.distance_cm()
-        if distance is not None and distance <= MAX_BIN_HEIGHT:
-            fill_percentage = ((MAX_BIN_HEIGHT - distance) / MAX_BIN_HEIGHT) * 100
-            return round(fill_percentage, 2)
-        return None
-    except OSError as e:
-        print("Ultrasonic sensor error:", str(e))
-        return None
-
-def get_sensor_data():
-    try:
-        dht_sensor.measure()
-        temperature = dht_sensor.temperature()
-        humidity = dht_sensor.humidity()
-        light_level = light_sensor.read()
-        bin_level = get_distance()
-
-        current_time = utime.localtime()
-        timestamp = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
-            current_time[0], current_time[1], current_time[2],
-            current_time[3], current_time[4], current_time[5]
-        )
-
-        return {
-            "timestamp": timestamp,
-            "temperature": temperature,
-            "humidity": humidity,
-            "lightLevel": light_level,
-            "binLevel": bin_level
-        }
-    except Exception as e:
-        print("Error reading sensors:", str(e))
-        return None
-
-def fetch_led_status():
-    global led_states
-    client = microcoapy.Coap()
-
-    # Define a callback function to handle the response
-    def received_message_callback(packet, sender):
-        global led_states
-        print(f"Message received from {sender}: {packet.toString()}")
-        print(f"Message payload: {packet.payload.decode('unicode_escape')}")
-
-        # Check if the response code is 2.05 Content
-        if packet.method == 0x45:  # 2.05 Content
-            try:
-                # Parse the JSON response
-                new_led_states = json.loads(packet.payload.decode('utf-8'))
-                print("Received LED status:", new_led_states)
-
-                # Update the LED states
-                led_states = new_led_states
-
-                # Control the LEDs based on the received status
-                led1.value(led_states["redLed"])
-                led2.value(led_states["yellowLed"])
-                led3.value(led_states["greenLed"])
-            except Exception as e:
-                print("Error parsing LED status:", str(e))
-        else:
-            print(f"Failed to fetch LED status: Response code {hex(packet.method)}")
-
-    try:
-        # Initialize the socket without binding to a specific port
-        client.start(port=0)  # Port 0 lets the OS assign an available port
-        print("Socket initialized for fetching LED status")
-
-        # Set the response callback
-        client.responseCallback = received_message_callback
-
-        # Send a GET request to the Spring Boot CoAP server
-        messageid = client.get(SPRING_SERVER_IP, SPRING_SERVER_PORT, LED_STATUS_RESOURCE)
-
-        # Debug: Print the messageid and request details
-        print(f"Message ID: {messageid}")
-        print(f"Sending GET request to coap://{SPRING_SERVER_IP}:{SPRING_SERVER_PORT}/{LED_STATUS_RESOURCE}")
-
-        if isinstance(messageid, int):
-            # Wait for the response with a timeout
-            start_time = utime.ticks_ms()
-            response_received = False
-
-            while utime.ticks_diff(utime.ticks_ms(), start_time) < 10000:  # Wait for 10 seconds
-                try:
-                    # Poll the server for incoming responses
-                    client.poll(100)  # Poll every 100ms
-                except Exception as e:
-                    print("Error in poll:", str(e))
-                    utime.sleep_ms(100)  # Small delay to avoid busy-waiting
-
-            if not response_received:
-                print("Timeout: No response received from the server")
-        else:
-            print("Unexpected response type:", type(messageid))
-    except Exception as e:
-        print("Error fetching LED status:", str(e))
-    finally:
-        client.stop()
-
-
-def setup_server():
-    server = microcoapy.Coap()
-    
-    # Handler for sensor data requests
-    def sensor_handler(packet, sender_ip, sender_port):
-        print(f'Sensor endpoint accessed from: {sender_ip}:{sender_port}')
+# Sensor and LED Management
+class SensorManager:
+    def __init__(self):
+        # Initialize sensors
+        self.dht_sensor = DHT22(Pin(PinConfig.DHT_PIN))
+        self.light_sensor = ADC(Pin(PinConfig.LIGHT_SENSOR_PIN))
+        self.light_sensor.atten(ADC.ATTN_11DB)
+        self.ultrasonic_sensor = HCSR04(trigger_pin=PinConfig.TRIG_PIN, 
+                                      echo_pin=PinConfig.ECHO_PIN)
         
-        if packet.method == COAP_METHOD.COAP_GET:
-            sensor_data = get_sensor_data()
-            if sensor_data:
-                response = json.dumps(sensor_data)
-                server.sendResponse(
-                    sender_ip, 
-                    sender_port, 
-                    packet.messageid,
-                    response,
-                    0x45,  # 2.05 Content
-                    0,     # No specific content format
-                    packet.token
-                )
-    
-    # Register endpoints
-    server.addIncomingRequestCallback('sensors', sensor_handler)
-    return server
+        # Initialize LEDs
+        self.led1 = Pin(PinConfig.LED1_PIN, Pin.OUT)
+        self.led2 = Pin(PinConfig.LED2_PIN, Pin.OUT)
+        self.led3 = Pin(PinConfig.LED3_PIN, Pin.OUT)
+        
+        # LED states
+        self.led_states = {
+            "redLed": False,
+            "yellowLed": False,
+            "greenLed": False
+        }
 
-def run_server():
-    # Connect to WiFi
-    connect_wifi('Galaxy A06 0a23', '12345678')
-    
-    # Setup and start server
-    server = setup_server()
-    server.start()  # Initialize the socket
-    print('CoAP server started. Waiting for requests...')
-    
-    while True:
+    def update_led_states(self, new_states):
+        """Update LED states and physical LED outputs"""
+        self.led_states = new_states
+        self.led1.value(new_states["redLed"])
+        self.led2.value(new_states["yellowLed"])
+        self.led3.value(new_states["greenLed"])
+
+    def get_distance(self):
+        """Get distance measurement and calculate fill percentage"""
         try:
-            # Poll the server for incoming requests
-            server.poll(10000)
+            distance = self.ultrasonic_sensor.distance_cm()
+            if distance is not None and distance <= PinConfig.MAX_BIN_HEIGHT:
+                fill_percentage = ((PinConfig.MAX_BIN_HEIGHT - distance) / 
+                                 PinConfig.MAX_BIN_HEIGHT) * 100
+                return round(fill_percentage, 2)
+            return None
+        except OSError as e:
+            print("Ultrasonic sensor error:", str(e))
+            return None
 
-            # Fetch LED status from the Spring Boot server every 5 seconds
-            fetch_led_status()
-            utime.sleep(5)  # Wait for 5 seconds before fetching again
-        except Exception as e:
-            print("Error in main loop:", str(e))
-            utime.sleep_ms(100)
-
-def main():
-    while True:
+    def get_sensor_data(self):
+        """Get data from all sensors"""
         try:
-            run_server()
-        except KeyboardInterrupt:
-            print("Server stopped by user")
-            break
-        except Exception as e:
-            print("Server error:", str(e))
-            print("Restarting server in 5 seconds...")
-            utime.sleep(5)
+            self.dht_sensor.measure()
+            temperature = self.dht_sensor.temperature()
+            humidity = self.dht_sensor.humidity()
+            light_level = self.light_sensor.read()
+            bin_level = self.get_distance()
 
+            current_time = utime.localtime()
+            timestamp = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
+                current_time[0], current_time[1], current_time[2],
+                current_time[3], current_time[4], current_time[5]
+            )
+
+            return {
+                "timestamp": timestamp,
+                "temperature": temperature,
+                "humidity": humidity,
+                "lightLevel": light_level,
+                "binLevel": bin_level
+            }
+        except Exception as e:
+            print("Error reading sensors:", str(e))
+            return None
+
+# Network Manager
+class NetworkManager:
+    @staticmethod
+    async def connect_wifi():
+        """Connect to WiFi network"""
+        wlan = network.WLAN(network.STA_IF)
+        wlan.active(True)
+        
+        if not wlan.isconnected():
+            print('Connecting to network...')
+            wlan.connect(NetworkConfig.WIFI_SSID, NetworkConfig.WIFI_PASSWORD)
+            
+            # Wait for connection with timeout
+            start_time = utime.time()
+            while not wlan.isconnected():
+                if utime.time() - start_time > 20:  # 20 second timeout
+                    raise Exception("WiFi connection timeout")
+                await asyncio.sleep_ms(100)
+                
+        print('Network config:', wlan.ifconfig())
+        return wlan
+
+# CoAP Client for LED Status
+class LEDStatusClient:
+    def __init__(self, sensor_manager):
+        self.sensor_manager = sensor_manager
+
+    async def fetch_led_status(self):
+        """Fetch LED status from Spring Boot server"""
+        client = microcoapy.Coap()
+        
+        def received_message_callback(packet, sender):
+            print(f"Message received from {sender}: {packet.toString()}")
+            
+            if packet.method == 0x45:  # 2.05 Content
+                try:
+                    new_led_states = json.loads(packet.payload.decode('utf-8'))
+                    print("Received LED status:", new_led_states)
+                    self.sensor_manager.update_led_states(new_led_states)
+                except Exception as e:
+                    print("Error parsing LED status:", str(e))
+            else:
+                print(f"Failed to fetch LED status: Response code {hex(packet.method)}")
+
+        try:
+            client.start(port=0)
+            client.responseCallback = received_message_callback
+            
+            messageid = client.get(
+                NetworkConfig.SPRING_SERVER_IP,
+                NetworkConfig.SPRING_SERVER_PORT,
+                NetworkConfig.LED_STATUS_RESOURCE
+            )
+            
+            if isinstance(messageid, int):
+                start_time = utime.ticks_ms()
+                while utime.ticks_diff(utime.ticks_ms(), start_time) < 5000:  # 5s timeout
+                    client.poll(100)
+                    await asyncio.sleep_ms(100)
+            
+        except Exception as e:
+            print("Error fetching LED status:", str(e))
+        finally:
+            client.stop()
+
+    async def run(self):
+        """Main LED status client loop"""
+        while True:
+            try:
+                await self.fetch_led_status()
+                await asyncio.sleep(5)  # 5 second delay between updates
+            except Exception as e:
+                print("LED client error:", str(e))
+                await asyncio.sleep(5)  # Wait before retry
+
+# CoAP Server
+class SensorServer:
+    def __init__(self, sensor_manager):
+        self.sensor_manager = sensor_manager
+        self.server = microcoapy.Coap()
+
+    def setup(self):
+        """Setup CoAP server and register endpoints"""
+        def sensor_handler(packet, sender_ip, sender_port):
+            print(f'Sensor endpoint accessed from: {sender_ip}:{sender_port}')
+            
+            if packet.method == COAP_METHOD.COAP_GET:
+                sensor_data = self.sensor_manager.get_sensor_data()
+                if sensor_data:
+                    response = json.dumps(sensor_data)
+                    self.server.sendResponse(
+                        sender_ip,
+                        sender_port,
+                        packet.messageid,
+                        response,
+                        0x45,  # 2.05 Content
+                        0,     # No specific content format
+                        packet.token
+                    )
+
+        self.server.addIncomingRequestCallback('sensors', sensor_handler)
+        self.server.start()
+        print('CoAP server started. Waiting for requests...')
+
+    async def run(self):
+        """Main server loop"""
+        self.setup()
+        while True:
+            try:
+                self.server.poll(1000)  # 1 second poll timeout
+                await asyncio.sleep_ms(100)  # Allow other tasks to run
+            except Exception as e:
+                print("Server error:", str(e))
+                await asyncio.sleep_ms(100)
+
+# Main Application
+class CoAPApplication:
+    def __init__(self):
+        self.sensor_manager = SensorManager()
+        self.led_client = LEDStatusClient(self.sensor_manager)
+        self.sensor_server = SensorServer(self.sensor_manager)
+
+    async def run(self):
+        """Run the main application"""
+        try:
+            # Connect to WiFi
+            await NetworkManager.connect_wifi()
+            
+            # Create tasks
+            server_task = asyncio.create_task(self.sensor_server.run())
+            client_task = asyncio.create_task(self.led_client.run())
+            
+            # Wait for both tasks
+            await asyncio.gather(server_task, client_task)
+            
+        except Exception as e:
+            print("Application error:", str(e))
+        finally:
+            # Cleanup if needed
+            pass
+
+# Entry point
 if __name__ == '__main__':
-    main()
+    app = CoAPApplication()
+    asyncio.run(app.run())
