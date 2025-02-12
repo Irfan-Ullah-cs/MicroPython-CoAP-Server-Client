@@ -8,6 +8,7 @@ from dht import DHT22
 import json
 import binascii
 import uasyncio as asyncio
+import cbor
 
 # Pin Definitions
 class PinConfig:
@@ -24,7 +25,7 @@ class PinConfig:
 class NetworkConfig:
     WIFI_SSID = 'Galaxy A06 0a23'
     WIFI_PASSWORD = '12345678'
-    SPRING_SERVER_IP = "192.168.152.113"
+    SPRING_SERVER_IP = "192.168.4.113"
     SPRING_SERVER_PORT = 5683
     LED_STATUS_RESOURCE = "led-status"
 
@@ -171,46 +172,110 @@ class LEDStatusClient:
                 print("LED client error:", str(e))
                 await asyncio.sleep(5)  # Wait before retry
 
-# CoAP Server
+# CoAP Server that responds to sensor requests using CBOR
 class SensorServer:
     def __init__(self, sensor_manager):
         self.sensor_manager = sensor_manager
         self.server = microcoapy.Coap()
 
     def setup(self):
-        """Setup CoAP server and register endpoints"""
+        """Setup the CoAP server and register the 'sensors' endpoint."""
         def sensor_handler(packet, sender_ip, sender_port):
-            print(f'Sensor endpoint accessed from: {sender_ip}:{sender_port}')
-            
-            if packet.method == COAP_METHOD.COAP_GET:
-                sensor_data = self.sensor_manager.get_sensor_data()
-                if sensor_data:
-                    response = json.dumps(sensor_data)
+            try:
+                print(f"Sensor endpoint accessed from: {sender_ip}:{sender_port}")
+
+                # Check if the request is a GET request.
+                if packet.method == COAP_METHOD.COAP_GET:
+                    sensor_data = self.sensor_manager.get_sensor_data()
+                    if sensor_data is not None:
+                        try:
+                            # Serialize sensor data using the single-file CBOR implementation.
+                            response_payload = cbor.dumps(sensor_data)
+                        except Exception as e:
+                            print("Error serializing sensor data to CBOR:", e)
+                            # If serialization fails, send a 5.00 Internal Server Error response.
+                            self.server.sendResponse(
+                                sender_ip,
+                                sender_port,
+                                packet.messageid,
+                                b'',
+                                0x50,  # 5.00 Internal Server Error
+                                60,    # Content format: application/cbor (code 60)
+                                packet.token
+                            )
+                            return
+
+                        # Send a successful response (2.05 Content) with the CBOR-encoded data.
+                        self.server.sendResponse(
+                            sender_ip,
+                            sender_port,
+                            packet.messageid,
+                            response_payload,
+                            0x45,  # 2.05 Content
+                            60,    # Content format: application/cbor
+                            packet.token
+                        )
+                    else:
+                        print("No sensor data available.")
+                        # If sensor data is missing, send a 4.04 Not Found error.
+                        self.server.sendResponse(
+                            sender_ip,
+                            sender_port,
+                            packet.messageid,
+                            b'',
+                            0x84,  # 4.04 Not Found
+                            60,
+                            packet.token
+                        )
+                else:
+                    print("Unsupported CoAP method received:", packet.method)
+                    # If the method is not GET, send a 4.05 Method Not Allowed error.
                     self.server.sendResponse(
                         sender_ip,
                         sender_port,
                         packet.messageid,
-                        response,
-                        0x45,  # 2.05 Content
-                        0,     # No specific content format
+                        b'',
+                        0x85,  # 4.05 Method Not Allowed
+                        60,
                         packet.token
                     )
+            except Exception as e:
+                print("Error handling sensor request:", e)
+                # In case of any error while handling the request, try to send a generic error response.
+                try:
+                    self.server.sendResponse(
+                        sender_ip,
+                        sender_port,
+                        packet.messageid,
+                        b'',
+                        0x50,  # 5.00 Internal Server Error
+                        60,
+                        packet.token
+                    )
+                except Exception as inner_e:
+                    print("Error sending error response:", inner_e)
 
-        self.server.addIncomingRequestCallback('sensors', sensor_handler)
-        self.server.start()
-        print('CoAP server started. Waiting for requests...')
+        # Register the 'sensors' endpoint and start the server.
+        try:
+            self.server.addIncomingRequestCallback("sensors", sensor_handler)
+            self.server.start()
+            print("CoAP server started. Waiting for requests...")
+        except Exception as e:
+            print("Error setting up the CoAP server:", e)
 
     async def run(self):
-        """Main server loop"""
+        """Main loop for the server."""
         self.setup()
         while True:
             try:
-                self.server.poll(1000)  # 1 second poll timeout
-                await asyncio.sleep_ms(100)  # Allow other tasks to run
-            except Exception as e:
-                print("Server error:", str(e))
+                # Poll for incoming requests with a 1-second timeout.
+                self.server.poll(1000)
+                # Briefly sleep to allow other tasks to run.
                 await asyncio.sleep_ms(100)
-
+            except Exception as e:
+                print("Server error:", e)
+                # On error, wait briefly before trying again to prevent a tight error loop.
+                await asyncio.sleep_ms(100)
 # Main Application
 class CoAPApplication:
     def __init__(self):
